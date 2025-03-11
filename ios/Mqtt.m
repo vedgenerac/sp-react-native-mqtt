@@ -1,4 +1,4 @@
-//
+///
 //  Mqtt.m
 //  RCTMqtt
 //
@@ -31,102 +31,160 @@
 - (id)init {
     if ((self = [super init])) {
         self.defaultOptions = @{
-                                @"host": @"localhost",
-                                @"port": @1883,
-                                @"protcol": @"tcp", //ws
-                                @"tls": @NO,
-                                @"keepalive": @120, //second
-                                @"clientId" : @"react-native-mqtt",
-                                @"protocolLevel": @4,
-                                @"clean": @YES,
-                                @"auth": @NO,
-                                @"user": @"",
-                                @"pass": @"",
-                                @"will": @NO,
-                                @"willMsg": [NSNull null],
-                                @"willtopic": @"",
-                                @"willQos": @0,
-                                @"willRetainFlag": @NO,
-                                @"certificatePass": @"",
-                                };
-        
+            @"host": @"localhost",
+            @"port": @1883,
+            @"protocol": @"tcp", // ws
+            @"tls": @NO,
+            @"keepalive": @120, // second
+            @"clientId": @"react-native-mqtt",
+            @"protocolLevel": @4,
+            @"clean": @YES,
+            @"auth": @NO,
+            @"user": @"",
+            @"pass": @"",
+            @"will": @NO,
+            @"willMsg": [NSNull null],
+            @"willtopic": @"",
+            @"willQos": @0,
+            @"willRetainFlag": @NO,
+            // New options for mTLS
+            @"clientCertPath": [NSNull null], // Path to .p12 file
+            @"clientCertPassword": [NSNull null], // Password for .p12 file
+            // New option for root CA
+            @"rootCAPath": [NSNull null] // Path to root CA .cer or .pem file
+        };
     }
-    
-    
-    
     return self;
 }
 
-- (instancetype) initWithEmitter:(RCTEventEmitter *) emitter
-                         options:(NSDictionary *) options
-                       clientRef:(NSString *) clientRef {
+- (instancetype)initWithEmitter:(RCTEventEmitter *)emitter
+                        options:(NSDictionary *)options
+                      clientRef:(NSString *)clientRef {
     self = [self init];
     self.emitter = emitter;
     self.clientRef = clientRef;
-    self.options = [NSMutableDictionary dictionaryWithDictionary:self.defaultOptions]; // Set default options
-    for (NSString *key in options.keyEnumerator) { // Replace default options
+    self.options = [NSMutableDictionary dictionaryWithDictionary:self.defaultOptions];
+    for (NSString *key in options.keyEnumerator) {
         [self.options setValue:options[key] forKey:key];
     }
-
-   
-    
-    
     return self;
 }
 
-- (void) connect {
-    
-    MQTTSSLSecurityPolicy *securityPolicy = nil;
-    if(self.options[@"tls"]) {
-        securityPolicy = [MQTTSSLSecurityPolicy policyWithPinningMode:MQTTSSLPinningModeNone];
-        securityPolicy.allowInvalidCertificates = YES;
+// Helper method to load client certificate from a .p12 file
+- (NSArray *)loadCertificatesFromP12:(NSString *)certPath password:(NSString *)password {
+    if (!certPath || [certPath isEqual:[NSNull null]] || !password || [password isEqual:[NSNull null]]) {
+        return nil;
     }
-    
-    NSArray *certificates = nil;
-    if(securityPolicy != nil && self.options[@"certificate"]){
 
-        @try {
-            
-            NSString *base64 = self.options[@"certificate"];        
-            NSData *base64Data = [[NSData alloc] initWithBase64EncodedString:base64 options:NSDataBase64DecodingIgnoreUnknownCharacters];
-            
-            CFArrayRef keyref = NULL;
-            OSStatus importStatus = SecPKCS12Import((__bridge CFDataRef)base64Data,
-                                                        (__bridge CFDictionaryRef)@{(__bridge id)kSecImportExportPassphrase: @""},
-                                                        &keyref);
-            
-            CFDictionaryRef identityDict = CFArrayGetValueAtIndex(keyref, 0);
-            
-            SecIdentityRef identityRef = (SecIdentityRef)CFDictionaryGetValue(identityDict,
-                                                                                 kSecImportItemIdentity);
-            
-            SecCertificateRef cert = NULL;
-            OSStatus status = SecIdentityCopyCertificate(identityRef, &cert);
-            
-            NSArray *clientCerts = @[(__bridge id)identityRef, (__bridge id)cert];
-                
-            // Certificate
-            certificates = clientCerts;
-        }
-        @catch (NSException *exception) {
-            NSLog(@"[KC MQTTS] %@", exception.reason);
-        }
+    NSData *p12Data = [NSData dataWithContentsOfFile:certPath];
+    if (!p12Data) {
+        NSLog(@"Failed to load certificate file at path: %@", certPath);
+        return nil;
     }
-    
+
+    CFStringRef passwordRef = (__bridge CFStringRef)password;
+    const void *keys[] = {kSecImportExportPassphrase};
+    const void *values[] = {passwordRef};
+    CFDictionaryRef optionsDict = CFDictionaryCreate(NULL, keys, values, 1, NULL, NULL);
+    CFArrayRef items = NULL;
+
+    OSStatus status = SecPKCS12Import((__bridge CFDataRef)p12Data, optionsDict, &items);
+    CFRelease(optionsDict);
+
+    if (status != errSecSuccess || !items) {
+        NSLog(@"Failed to import PKCS12 data: %d", (int)status);
+        return nil;
+    }
+
+    CFDictionaryRef identityDict = CFArrayGetValueAtIndex(items, 0);
+    SecIdentityRef identity = (SecIdentityRef)CFDictionaryGetValue(identityDict, kSecImportItemIdentity);
+    if (!identity) {
+        CFRelease(items);
+        return nil;
+    }
+
+    SecCertificateRef certificate = NULL;
+    status = SecIdentityCopyCertificate(identity, &certificate);
+    if (status != errSecSuccess || !certificate) {
+        CFRelease(items);
+        return nil;
+    }
+
+    NSArray *certificates = @[(__bridge id)identity, (__bridge id)certificate];
+    CFRelease(certificate);
+    CFRelease(items);
+
+    return certificates;
+}
+
+// Helper method to load root CA certificate from a file
+- (SecCertificateRef)loadRootCACertificateFromPath:(NSString *)rootCAPath {
+    if (!rootCAPath || [rootCAPath isEqual:[NSNull null]]) {
+        return NULL;
+    }
+
+    NSData *rootCAData = [NSData dataWithContentsOfFile:rootCAPath];
+    if (!rootCAData) {
+        NSLog(@"Failed to load root CA file at path: %@", rootCAPath);
+        return NULL;
+    }
+
+    SecCertificateRef rootCACert = SecCertificateCreateWithData(NULL, (__bridge CFDataRef)rootCAData);
+    if (!rootCACert) {
+        NSLog(@"Failed to create SecCertificateRef from root CA data");
+    }
+
+    return rootCACert;
+}
+
+- (void)connect {
+    MQTTSSLSecurityPolicy *securityPolicy = nil;
+    NSArray *certificates = nil;
+
+    if ([self.options[@"tls"] boolValue]) {
+        // Initialize security policy
+        securityPolicy = [MQTTSSLSecurityPolicy policyWithPinningMode:MQTTSSLPinningModeNone];
+        securityPolicy.allowInvalidCertificates = YES; // Set to NO in production for strict validation
+
+        // Load root CA certificate for server certificate validation
+        NSString *rootCAPath = self.options[@"rootCAPath"];
+        SecCertificateRef rootCACert = [self loadRootCACertificateFromPath:rootCAPath];
+        if (rootCACert) {
+            securityPolicy.pinnedCertificates = @[(__bridge id)rootCACert];
+            securityPolicy.validatesCertificateChain = YES; // Enable chain validation with root CA
+            CFRelease(rootCACert); // Release after adding to array
+        }
+
+        // Load client certificate for mTLS (if provided)
+        NSString *certPath = self.options[@"clientCertPath"];
+        NSString *certPassword = self.options[@"clientCertPassword"];
+        certificates = [self loadCertificatesFromP12:certPath password:certPassword];
+    }
+
     NSData *willMsg = nil;
-    if(self.options[@"willMsg"] != [NSNull null]) {
+    if (self.options[@"willMsg"] != [NSNull null]) {
         willMsg = [self.options[@"willMsg"] dataUsingEncoding:NSUTF8StringEncoding];
     }
+
     if (!self.manager) {
         dispatch_queue_t queue = dispatch_queue_create("com.hawking.app.anchor.mqtt", NULL);
         
-        self.manager = [[MQTTSessionManager alloc] initWithPersistence:NO maxWindowSize:MQTT_MAX_WINDOW_SIZE maxMessages:MQTT_MAX_MESSAGES maxSize:MQTT_MAX_SIZE maxConnectionRetryInterval:60.0 connectInForeground:NO streamSSLLevel:nil queue: queue];
+        self.manager = [[MQTTSessionManager alloc] initWithPersistence:NO
+                                                        maxWindowSize:MQTT_MAX_WINDOW_SIZE
+                                                          maxMessages:MQTT_MAX_MESSAGES
+                                                              maxSize:MQTT_MAX_SIZE
+                                           maxConnectionRetryInterval:60.0
+                                                  connectInForeground:NO
+                                                       streamSSLLevel:nil
+                                                                queue:queue];
         self.manager.delegate = self;
+
         MQTTCFSocketTransport *transport = [[MQTTCFSocketTransport alloc] init];
         transport.host = [self.options valueForKey:@"host"];
         transport.port = [self.options[@"port"] intValue];
         transport.voip = YES;
         self.manager.session.transport = transport;
+
         [self.manager connectTo:[self.options valueForKey:@"host"]
                            port:[self.options[@"port"] intValue]
                             tls:[self.options[@"tls"] boolValue]
@@ -145,14 +203,23 @@
                    certificates:certificates
                   protocolLevel:MQTTProtocolVersion311
                  connectHandler:^(NSError *error) {
-                     NSLog(@"[KC MQTTS] connection error %@", error);
-         }];
-
+                     if (error) {
+                         [self.emitter sendEventWithName:@"mqtt_events"
+                                                    body:@{@"event": @"error",
+                                                           @"clientRef": self.clientRef,
+                                                           @"message": [error localizedDescription]}];
+                     }
+                 }];
     } else {
         [self.manager connectToLast:^(NSError *error) {
+            if (error) {
+                [self.emitter sendEventWithName:@"mqtt_events"
+                                           body:@{@"event": @"error",
+                                                  @"clientRef": self.clientRef,
+                                                  @"message": [error localizedDescription]}];
+            }
         }];
     }
-   
 }
 
 - (void)sessionManager:(MQTTSessionManager *)sessonManager didChangeState:(MQTTSessionManagerState)newState {
